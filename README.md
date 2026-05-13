@@ -1,5 +1,5 @@
 #An Integrated Step Selection (ISSA) on GPS collared mountain lions in California's North Bay Area. 
-#This code find how these mountain lions select/avoid burn severity, years since a burn occured, and vegetation in their habitats.
+#This code finds how these mountain lions select/avoid burn severity, years since a burn occured, and vegetation in their habitats.
 
 #ISSA is a spatial analysis method that is used to study the habitat preferences and movement patterns of tracked animals (Hoffman et. al, 2024). 
 #To conduct the ISSA analysis, the amt (animal movement tools)  library was used, and I downloaded the outline of a basic ISSA code 
