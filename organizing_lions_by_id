@@ -1,0 +1,571 @@
+
+# basic initial cleaning of mountain lion GPS collar data
+# 1. exclude initial data when P2, P6, and P19 were dependent with P1 based on their proximity to each other  
+# 2. filter for higher accuracy GPS points
+# 3. convert fixes to steps
+
+
+# this requires:
+# "C:/Users/scott.jennings/OneDrive - Audubon Canyon Ranch/Projects/other_research/mt_lion_data_work/data/lion_deployments.csv"
+# "C:/Users/scott.jennings/OneDrive - Audubon Canyon Ranch/Projects/other_research/mt_lion_data_work/data/cleaned_collars"
+
+# this creates:
+# "data/p1_family_proximity.csv" - distances between P1 and her kittens
+# "data/analysis_table" - the cleaned fixes with the dependent P2, P6, and P19 data filtered out
+# "data/puma_steps" - the cleaned fixes converted to steps
+
+# this optionally creates
+# "figures/p1_family_proximity.png" - figure of distances between P1 and her kittens
+# "data/pre_analysis_table" - uncleaned fixes with the dependent P2, P6, and P19 data filtered out
+
+
+
+library(tidyverse)
+library(here)
+library(sf)
+
+# this is needed for puma_proximity()
+source("C:/Users/scott.jennings/OneDrive - Audubon Canyon Ranch/Projects/other_research/mt_lion_data_work/code/mountain_lion_utilities.R")
+
+# this is needed for exclude_pumas
+source(here("code/helper_data.R"))
+
+
+
+# number of days to trim from start and end of each collar deployment
+start.buffer = 1
+end.buffer = -2
+
+
+# read data prepared in  C:/Users/scott.jennings/OneDrive - Audubon Canyon Ranch/Projects/other_research/mt_lion_data_work/code/clean_raw_download.R
+deployments <- read_csv("C:/Users/scott.jennings/OneDrive - Audubon Canyon Ranch/Projects/other_research/mt_lion_data_work/data/lion_deployments.csv") %>% 
+  mutate(animal.id = ifelse(animal.id == "P5*", "P5", animal.id))
+
+collars <- readRDS("C:/Users/scott.jennings/OneDrive - Audubon Canyon Ranch/Projects/other_research/mt_lion_data_work/data/cleaned_collars") 
+
+# first need to ID when P2, P6, and P19 were still dependent on P1 ----
+# use puma_proximity() from mt_lion_data_work/code/mountain_lion_utilities.R
+
+
+
+p1_family_proximity <- bind_rows(puma_proximity("P1", "P2"),
+                                 puma_proximity("P1", "P6"),
+                                 puma_proximity("P1", "P19")) %>% 
+  arrange(round.datetime) %>%
+  filter(!is.na(dist)) %>% 
+  mutate(date.local = as.Date(round.datetime, "America/Los_Angeles"),
+         week = format(date.local, "%Y%U")) %>% 
+  group_by(cat2.id, week) %>%
+  mutate(mean.weekly.dist = mean(dist),
+         time.diff = cat1.time - cat2.time) %>% 
+  ungroup()
+
+write.csv(p1_family_proximity, here("data/p1_family_proximity.csv"), row.names = FALSE)
+
+p1_family_proximity <- read.csv(here("data/p1_family_proximity.csv"))
+
+p1_family_proximity <- p1_family_proximity %>% 
+  mutate(date.local = as.Date(date.local))
+
+p1_family_proximity %>%  
+  ggplot() +
+  geom_line(aes(x = date.local, y = dist, color = cat2.id)) +
+  geom_line(aes(x = date.local, y = mean.weekly.dist, color = cat2.id), linewidth = 2) +
+  # stat_smooth(aes(x = date.local, y = dist, group = cat2.id), color = "gray10", linewidth = 2, se = FALSE, span = 0.2, method = "loess") +
+  theme_bw() +
+  scale_x_date(date_breaks = "1 month") +
+  labs(x = "Date",
+       y = "Distance (m)",
+       title = "Distance between P1 and 3 of her kittens",
+       color = "Kitten ID") +
+  facet_wrap(~cat2.id, nrow = 3, scales = "free")
+
+# ggsave(here("figures/p1_family_proximity.png"), width = 10)
+
+# there seems to be a clear dependent/independent signal when the weekly average distance goes above 1 km (checking with Quinton about this as of 3/13/24)
+
+independent_dates <- p1_family_proximity %>% 
+  filter(mean.weekly.dist > 1000) %>% 
+  group_by(cat2.id) %>% 
+  filter(cat2.time == min(cat2.time)) %>% 
+  select(animal.id = cat2.id, min.datetime = cat2.time)
+
+# update the analysis_dates table ----
+analysis_dates <- collars %>% 
+  full_join(independent_dates) %>% 
+  mutate(new.start = if_else(animal.id %in% independent_dates$animal.id, min.datetime, as.POSIXct(paste(collar.start + start.buffer, "00:00:01"), format = "%Y-%m-%d %H:%M:%S")),
+         new.end = as.POSIXct(paste(collar.end + end.buffer, "23:59:59"), format = "%Y-%m-%d %H:%M:%S")) %>% 
+  filter(!animal.id %in% exclude_pumas)
+
+
+pre_analysis_table <- right_join(deployments, analysis_dates) %>% 
+  select(animal.id, collar.id, datetime.local, date.local, collar.start, collar.end, latitude, longitude, altitude, dop, fix.type, sex, collar, age, new.start, new.end) %>% 
+  mutate(keep.row = between(datetime.local, new.start, new.end))
+
+# saveRDS(pre_analysis_table, here("data/pre_analysis_table"))
+# don't think there's any reason to save this
+
+# initially and arbitrarily used dop < 5 while getting the code to run, then switched to dop < 10 following 
+# McClure, M. L., B. G. Dickson, and K. L. Nicholson. 2017. Modeling connectivity to identify current and future anthropogenic barriers to movement of large carnivores: A case study in the American Southwest. Ecology and Evolution 7:3762–3772.
+# and
+# D’eon, R. G., and D. Delparte. 2005. Effects of radio-collar position and orientation on GPS radio-collar performance, and the implications of PDOP in data screening. Journal of Applied Ecology 42:383–388.
+# D’eon and Delparte found that eliminating 2D fixes improved accuracy similar to only using dop < 10, but that it eliminated 7.7% of the data whereas using dop < 10 eliminated only 1.3% of their data. In our dataset, filtering dop > 10 | fix.type %in% c("2D", "No Fix") causes a 2.1% data loss, which we feel is acceptable so we filtered based on both dop < 10 and fix type = 3D 
+
+
+analysis_table <- pre_analysis_table %>% 
+#analysis_table <- readRDS(here("data/pre_analysis_table")) %>% 
+  filter(keep.row == TRUE, dop < 10, str_detect(fix.type, "3D")) %>% 
+  select(animal.id, collar.id, datetime.local, date.local, latitude, longitude, altitude, dop, sex, collar, age)
+
+
+saveRDS(analysis_table, here("data/analysis_table"))
+
+# converting single row GPS data to paired-GPS steps ----
+
+# load lion GPS data and convert to steps ----
+analysis_table <- readRDS(here("data/analysis_table"))
+
+readRDS(here("data/analysis_table")) %>% 
+  filter(animal.id %in% analysis_pumas, !animal.id %in% few_crossings_pumas) %>% 
+ # write.csv(here("data/analysis_table_max_filt_puma.csv"), row.names = FALSE) 
+  saveRDS(here("data/analysis_table_max_filt_puma"))
+
+#
+# simpler way of creating steps, this doesn't resample so we keep all steps ----
+# need to convert to sf object so can change lat/lon to UTM
+puma_gps_utm <- analysis_table %>% 
+  select(animal.id, collar.id, longitude, latitude, datetime.local) %>% 
+  st_as_sf(x = .,
+           coords = c("longitude", "latitude"),
+           crs = 4326) %>% 
+  st_transform(crs = 26910) %>% 
+  mutate(easting = st_coordinates(.)[,1],
+         northing = st_coordinates(.)[,2]) 
+
+# then converting fixes to steps
+puma_steps <- puma_gps_utm %>% 
+  data.frame() %>% 
+  arrange(animal.id, datetime.local) %>% 
+  group_by(animal.id, collar.id) %>% 
+  mutate(datetime.local.end = lead(datetime.local),
+         easting.end = lead(easting),
+         northing.end = lead(northing),
+         step.dur = datetime.local.end - datetime.local) %>% 
+  ungroup() %>% 
+  filter(!is.na(easting.end)) %>% 
+  mutate(step.dist = st_distance(st_as_sf(., coords = c("easting", "northing"), crs=26910),
+                                 st_as_sf(., coords = c("easting.end", "northing.end"), crs=26910), by_element = TRUE),
+         step.id = paste(animal.id, collar.id, row_number(), sep = "_")) %>% 
+  select(-geometry) 
+
+
+saveRDS(puma_steps, here("data/puma_steps"))
+
+
+puma_steps <- readRDS(here("data/puma_steps"))
+
+
+# data management ----
+
+
+
+
+#' puma_fix_rawdat_colnames
+#' 
+#' mountain lion xlsx and csv data files come in with all sorts of funky column names. this tidies them up
+#'
+#' @param df 
+#'
+#' @return
+#' @export
+#'
+#' @examples
+puma_fix_colnames <- function(df) {
+  names(df) <- str_replace_all(names(df), "Â°", "")
+  names(df) <- str_replace_all(names(df), "\\∞", "")
+  names(df) <- str_replace_all(names(df), "\\°", "")
+  names(df) <- str_replace_all(names(df), "#", "")
+  names(df) <- str_replace_all(names(df), "_", ".")
+  names(df) <- str_replace_all(names(df), "\\(", "")
+  names(df) <- str_replace_all(names(df), "\\)", "")
+  names(df) <- str_replace_all(names(df), "\\[", "")
+  names(df) <- str_replace_all(names(df), "\\]", "")
+  names(df) <- trimws(names(df))
+  names(df) <- str_replace_all(names(df), " ", ".")
+  names(df) <- tolower(names(df))
+  names(df) <- str_replace_all(names(df), "temperature", "temp")
+  names(df) <- str_replace_all(names(df), "ecef\\.", "ecef")
+  names(df) <- str_replace_all(names(df), "date.gmt", "utc.date")
+  names(df) <- str_replace_all(names(df), "time.gmt", "utc.time")
+  return(df)
+}
+
+
+
+puma_sheet_merger_deprecated <- function(zfile) {
+  # for the 1 .csv file
+  if(grepl(".csv", zfile)) {
+    all_data <- read_csv(zfile, locale=locale(encoding="latin1")) %>% 
+      mutate(zfile = zfile) %>% 
+      mutate(date = as.Date(UTC_Date, format = "%m/%d/%Y"),
+             time = as.character(UTC_Time),
+             datetime = paste(as.character(date), time),
+             datetime = as.POSIXct(datetime, format = "%Y-%m-%d %H:%M:%S", tz = "GMT"),
+             datetime.local = with_tz(datetime, tzone = "America/Los_Angeles"),
+             zfile = gsub("V:/Mountain Lion data/Jan 2023/PUMA_GPS_DATA_31DEC2022/", "", zfile)) %>% 
+      rename("Latitude" = `Latitude [°]`,
+             "Longitude" = `Longitude [°]`) %>% 
+      separate(zfile, "puma", sep = " ") %>% 
+      select(puma, CollarID, ID, Latitude, Longitude, date, time, datetime, datetime.local) %>% 
+      separate(datetime.local, c("date.local", "time.local"), sep = " ", remove = FALSE)
+  }
+  # for the 1 file with Lotek collar data
+  if(grepl("LOTEK", zfile)) {
+    
+    zsheets <- excel_sheets(zfile)
+    zsheet <- ifelse(length(zsheets) > 1, zsheets[grepl("ALL", zsheets)],
+                     zsheets[1])
+    all_data <- read_xlsx(zfile, sheet = zsheet) %>% 
+      mutate(zfile = zfile) %>%
+      separate(`Time (GMT)`, c("junk", "time"), sep = " ") %>% 
+      mutate(date= as.Date(`Date (GMT)`, format = "%d.%m.%Y"),
+             datetime = paste(as.character(date), time),
+             datetime = as.POSIXct(datetime, format = "%Y-%m-%d %H:%M:%S", tz = "GMT"),
+             datetime.local = with_tz(datetime, tzone = "America/Los_Angeles"),
+             zfile = gsub("V:/Mountain Lion data/Jan 2023/PUMA_GPS_DATA_31DEC2022/", "", zfile),
+             CollarID = NA,
+             ID = NA) %>% 
+      separate(zfile, "puma", sep = " ") %>% 
+      select(puma, CollarID, ID, Latitude, Longitude, date, time, datetime, datetime.local) %>% 
+      separate(datetime.local, c("date.local", "time.local"), sep = " ", remove = FALSE)
+  }
+  
+  
+  if(!grepl(".csv", zfile) & !grepl("LOTEK", zfile)) {
+    zsheets <- excel_sheets(zfile)
+    zsheet <- ifelse(length(zsheets) > 1, zsheets[grepl("ALL", zsheets)],
+                     zsheets[1])
+    all_data <- read_xlsx(zfile, sheet = zsheet) %>% 
+      mutate(zfile = zfile) %>%
+      separate(UTC_Time, c("junk", "time"), sep = " ") %>% 
+      mutate(date = as.Date(UTC_Date, format = "%Y-%m-%d"),
+             datetime = paste(as.character(date), time),
+             datetime = as.POSIXct(datetime, format = "%Y-%m-%d %H:%M:%S", tz = "GMT"),
+             datetime.local = with_tz(datetime, tzone = "America/Los_Angeles"),
+             zfile = gsub("V:/Mountain Lion data/Jan 2023/PUMA_GPS_DATA_31DEC2022/", "", zfile)) %>% 
+      rename("Latitude" = `Latitude [°]`,
+             "Longitude" = `Longitude [°]`) %>% 
+      separate(zfile, "puma", sep = " ") %>% 
+      select(puma, CollarID, ID, Latitude, Longitude, date, time, datetime, datetime.local) %>% 
+      separate(datetime.local, c("date.local", "time.local"), sep = " ", remove = FALSE)
+  }
+  
+  return(all_data)
+}
+
+
+
+
+#    mutate(datetime = paste(as.character(date), time),
+#           datetime = as.POSIXct(datetime, format = "%Y-%m-%d %H:%M:%S", tz = "GMT"),
+#           datetime.local = with_tz(datetime, tzone = "America/Los_Angeles")) 
+
+
+set_puma_order <- function(df) {
+  
+  df <- df %>% 
+    mutate(puma.num = str_extract(puma, "(\\d+)"),
+           puma.num = as.numeric(puma.num)) %>% 
+    arrange(puma.num) %>% 
+    mutate(puma = fct_inorder(puma))
+  
+}
+
+
+#' puma_mapper
+#' 
+#' create a simple map showing the path for an individual collared mountain lion. requires all_lions_combined_locations to be loaded in the global environment. currently uses google standard view as the base map.  
+#'
+#' @param zpuma mountain lion ID
+#'
+#' @return
+#' @export
+#'
+#' @examples
+#' puma_mapper("P1")
+puma_mapper <- function(zpuma) {
+  zdata <- all_lions_combined_locations %>% 
+    filter(puma == zpuma)
+  
+  first_last <- zdata %>% 
+    mutate(first.last = case_when(datetime.local == min(datetime.local) ~ "First GPS fix",
+                                  datetime.local == max(datetime.local) ~ "Last GPS fix",
+                                  TRUE ~ NA)) %>% 
+    filter(!is.na(first.last)) %>% 
+    mutate(first.last = paste(first.last, ":", datetime.local))
+  
+  lon_buffer <- 0.3 * (max(zdata$Longitude) - min(zdata$Longitude))
+  lat_buffer <- 0.3 * (max(zdata$Latitude) - min(zdata$Latitude))
+  
+min_lon = min(zdata$Longitude) - lon_buffer
+min_lat = min(zdata$Latitude) - lat_buffer
+max_lon = max(zdata$Longitude)+ lon_buffer
+max_lat = max(zdata$Latitude)+ lat_buffer
+  
+  
+  zbase_map <- ggmap::get_map(location = c(floor(min_lon), 
+                                           floor(min_lat), 
+                                           ceiling(max_lon), 
+                                           ceiling(max_lat)),
+                       source = "google")
+  
+  ggmap::ggmap(zbase_map) +
+    geom_path(data = zdata, aes(x = Longitude, y = Latitude), color = "blue") +
+    geom_point(data = first_last, aes(x = Longitude, y = Latitude, color = first.last), size = 3) +
+    scale_color_manual(values = c("green", "red")) +
+    labs(x = "",
+         y = "",
+         color = "",
+         title = zpuma) + 
+    ylim(min_lat, max_lat) +
+    xlim(min_lon, max_lon) +
+    theme(legend.position="top", 
+          legend.direction = "vertical",
+          axis.text=element_blank(),
+          axis.ticks = element_blank(),
+          legend.title=element_blank(),
+          plot.margin = unit(c(0, -1, -1, -1), 'lines'))
+}
+
+
+
+names_for_out_table <- function(df) {
+  
+  names(df) <- str_to_sentence(names(df))
+  names(df) <- str_replace_all(names(df), "\\.", " ")
+  return(df)
+}
+
+
+
+# data exploration ----
+
+#' puma_proximity
+#' 
+#' calculate distance in meters between two mt lions. requires data frame with at least these columns: animal.id, datetime.local, latitude, longitude
+#' uses geosphere::distHaversine
+#'
+#' @param puma1 
+#' @param puma2 
+#'
+#' @return
+#' @export
+#'
+#' @examples
+puma_proximity <- function(puma1, puma2) {
+df <- deployments %>% 
+  select(animal.id, datetime.local, latitude, longitude) %>% 
+  mutate(round.datetime = round_date(datetime.local, unit = "1 hour"))
+
+cat1 <- df %>% 
+  filter(animal.id == puma1) %>% 
+  rename(cat1.id = animal.id,
+         cat1.time = datetime.local,
+         cat1.lat = latitude,
+         cat1.lon = longitude)
+
+cat2 <- df %>% 
+  filter(animal.id == puma2) %>% 
+  rename(cat2.id = animal.id,
+         cat2.time = datetime.local,
+         cat2.lat = latitude,
+         cat2.lon = longitude)
+
+df_proximity <- right_join(cat1, cat2) %>%
+  mutate(
+    dist = geosphere::distHaversine(cbind(cat1.lon, cat1.lat), cbind(cat2.lon, cat2.lat))
+  )
+return(df_proximity)
+}
+
+install.packages("openxlsx")
+
+library(openxlsx)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(data.table)
+library(fuzzyjoin)
+library(here)
+
+source(here("mountain_lion_utilities.R"))
+
+options(scipen = 999)
+
+
+# this file has the animal ID and start and end date for each collar deployment 
+# in case there is anything funky in any of the date fields, read all columns as text rather than try to automatically parse them
+# end date esp might be filled with "-" for any active collars
+collars <- read_xlsx(here("Lion_Collar_Info_Copy.xlsx"), 
+                     sheet = "collar date info Jan2026",
+                     col_types = c("text")) %>%
+  rename_all(., ~tolower(.)) %>% 
+  rename_all(., ~trimws(.)) %>% 
+  rename_all(., ~str_replace_all(., " ", ".")) %>%
+  mutate(collar.start = case_when(collar.start == "-" ~ as.Date(NA),
+                                  TRUE ~ as.Date(as.numeric(collar.start), origin = "1899-12-30")),
+         collar.end = case_when(collar.end == "-" ~ as.Date(Sys.Date()), # fill end date as today's date for any still active collars so later calculation doesn't fail
+                                TRUE ~ as.Date(as.numeric(collar.end), origin = "1899-12-30")),
+         collar.id = as.numeric(collar.id)) %>% 
+  select(animal.id, sex, collar, collar.id, age, collar.start, collar.end, manufacturer) %>% 
+  filter(!is.na(animal.id))
+
+saveRDS(collars, here("cleaned_collars"))
+
+
+# COLLAR DATE INFO_SJ_edit.csv is a manually edited version of the collar date info sheet in COLLAR DATE INFO_31Dec2022.xlsx. so far I have added 
+# collar 90390 for P33
+# this edited file no longer needed with COLLAR DATE INFO_31Dec2023.xlsx from Q
+# collars <- read_csv(here("data/COLLAR DATE INFO_31Dec2023.csv")) %>% 
+#  mutate(across(c(collar.start, collar.end), ~mdy(.)))
+
+
+# 1 collar has been given to another project and the data can't be uploaded to Inventa
+collar32188 <- read_csv(here("GPS_Collar32188_20240214171531.csv"), col_select = c(1:18), locale=locale(encoding="latin1"), show_col_types = FALSE) %>% 
+  puma_fix_colnames()%>% 
+  mutate(  acq..time..utc. = as.POSIXct(paste(utc.date, utc.time), format = "%m/%d/%Y %H:%M:%S", tz = "GMT"),
+           datetime.local = with_tz(acq..time..utc., tzone = "America/Los_Angeles"),
+           date.local = as.Date(acq..time..utc., "America/Los_Angeles")) %>% 
+  rename(collar.id = collarid) %>% 
+  select(collar.id, acq..time..utc., datetime.local, date.local, origin, latitude, longitude, altitude = height.m, dop, fix.type = fixtype) 
+# message about new names is ok. there are a bunch of funky/repeat named columns to the right of the actual data, col_select inside read_csv drops these columns, but apparently the column rename happens first inside read_csv
+
+
+
+# downloaded from https://inventa.vectronic-wildlife.com/positions
+#all_data_dl <- read.csv(here("data/raw_data/downloaded/Position-2024-Feb-08_10-13-52.csv")) %>% 
+all_data_dl <- read_xlsx(here("Lion_Positions_Copy.xlsx")) %>% 
+  rename_all(., ~tolower(.)) %>%
+  rename(collar.id="collar id")
+  names(all_data_dl) <- str_replace(names(all_data_dl), "\\[", "")
+  names(all_data_dl) <- str_replace(names(all_data_dl), "\\]", "")
+  names(all_data_dl) <- str_replace_all(names(all_data_dl), " ", "")
+  names(all_data_dl) <- str_replace(names(all_data_dl), "acq.timeutc", "acqtimeutc")
+  names(all_data_dl) <- str_replace(names(all_data_dl), "tempâ°c", "tempac")
+
+all_data_dl <- all_data_dl %>%
+   mutate(acqtimeutc = as.POSIXct(acqtimeutc, format = "%Y-%m-%d %H:%M:%S", tz = "GMT"),
+           datetime.local = with_tz(acqtimeutc, tzone = "America/Los_Angeles"),
+           date.local = as.Date(acqtimeutc, "America/Los_Angeles")) %>% 
+  select(collar.id, acqtimeutc, datetime.local, date.local, origin, latitude = latitudedeg, longitude = longitudedeg, altitude = altitudem, dop, fixtype, tempac, mainv, beaconv) 
+
+  names(all_data_dl)
+
+# join 32188 with the rest of the collar data
+collar_data <- bind_rows(all_data_dl, collar32188) %>% 
+  filter(!is.na(latitude)) %>% # remove records with no coordinates 
+  filter(year(date.local) > 2015) # remove records from before the project started (Q must have either used some of these collars on a different project, or gotten them from other researchers who used them on a different project)
+  
+
+# there should only be one fix per collar and timestamp. turns out there are a few duplicates, and all from collar 32188; probably not enough to cause trouble but might want to filter these out depending on use
+  collar_data %>% 
+    count(collar.id, datetime.local) %>% 
+    filter(n > 1) %>% 
+    view()
+  
+  
+  # the same collars were deployed on different lions
+  # need to assign each gps fix to the right animal id, based on deployment dates
+  # joining on collar.id field. 
+  # this is an expected many to many join:
+  #     some fixes may have more than 1 collar deployment if the collar was reused
+  #     and all collar deployments will have many fixes
+ 
+   
+  data <- collar_data %>% 
+    full_join( collars)
+  
+  # then check whether the timestamp for the fix is between the start and end date for that deployment
+  data <- data %>% 
+    mutate(test = dplyr::between(date.local, collar.start, collar.end)) %>% 
+    arrange(animal.id, collar.id, datetime.local) %>% 
+    select(animal.id, collar.id, datetime.local, date.local, collar.start, collar.end, test, everything())
+
+# might want to examine this to spot check whether the test field was filled correctly  
+
+# in this checking helper, each collar should have 1 at least in the TRUE column (means there are fixes from this collar during a deployment for this collar), and probably also will have 1 in FALSE (means there are fixes fro this collar when it wasn't deployed; this is common and expected)
+data %>% 
+  filter(year(date.local) > 2015) %>% 
+  group_by(collar.id) %>% 
+  distinct(test) %>% 
+  ungroup() %>% 
+  mutate(value = 1) %>% 
+  pivot_wider(id_cols = c(collar.id), names_from = test) %>% 
+  view()
+
+    
+# checking for overlap when same collar deployed on different lions
+# in this helper, should investigate any instance where:
+#     a lion has TRUE in the same year for multiple collars
+#     a collar has TRUE for multiple lions in the same year
+data %>% 
+  distinct(animal.id, collar.id, year(datetime.local), test) %>% 
+  rename("year" = 3) %>% 
+  group_by(animal.id, collar.id, year) %>% 
+  summarise(collar.active = paste(test, collapse = ", ")) %>% 
+  ungroup() %>% 
+  filter(!is.na(year)) %>% 
+  arrange(animal.id, year) %>% 
+  pivot_wider(id_cols = c(animal.id, collar.id), values_from = collar.active, names_from = year) %>% 
+  select(animal.id, collar.id,"2016", "2017", "2018", "2019", "2020", "2021", "2022", "2023", "2024") %>% 
+  view()
+
+
+# in these helper functions, there shouldn't be any overlap in TRUE across rows in the plots
+
+# run this function for each animal.id
+# e.g. deployment_date_checker_by_animal("P1")
+deployment_date_checker_by_animal <- function(zanimal) {
+data %>% 
+  filter(animal.id == zanimal) %>% 
+  ggplot() +
+  geom_line(aes(x = datetime.local, y = as.factor(collar.id), color = test), linewidth = 2)
+}
+  
+
+# run this function for each collar.id
+# e.g. deployment_date_checker_by_collar(23163)
+deployment_date_checker_by_collar <- function(zcollar) {
+data %>% 
+  filter(collar.id == zcollar) %>% 
+  ggplot() +
+  geom_line(aes(x = datetime.local, y = animal.id, color = test), linewidth = 2)
+}
+
+
+
+# once you're satisfied that the test field was filled in correctly filter to just the correct date ranges
+deployments <- data %>% 
+  filter(test == TRUE) %>% 
+  select(-test) 
+
+
+
+# summarize number of points per year per lion
+lion_collar_summary <- deployments %>% 
+  group_by(animal.id, collar.id, collar.start, collar.end) %>%
+  summarise(num.row = n(),
+            min.date = min(date.local),
+            max.date = max(date.local))
+
+
+
+lion_collar_summary %>% arrange(animal.id, min.date) %>% view()
+
+ 
+# finally write the cleaned data frame
+write.csv(deployments, here("lion_deployments.csv"), row.names = FALSE)
+
+
+
+
