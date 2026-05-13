@@ -1,0 +1,456 @@
+# An Spatial Analysis of the Effects of Wildfire Burn Severity on the 
+# Movement Patterns of Mountain Lions in California’s Northern Bay Area
+# From 2016 - 2024, Through the Use of Integrated Step Selection Analysis (ISSA) 
+
+# Adapted by Emily Dewing <ekdewing10899@gmail.com> and Scott Jennings, originating 
+# from the ESA Statistical Methods Seminar Series from 07 March 2022, 
+# by Brian J. Smith <brian.smith@usu.edu>
+
+# set working directory
+setwd("C:/Users/ekdew/Downloads/Mountain_Lion_Fire_Folder")
+
+# load in libraries
+library(tidyverse)
+library(raster)
+library(amt)
+library(lubridate)
+library(readxl)
+library(sf)
+library(ggplot2)
+library(terra)
+library(here)
+library(suncalc)
+
+# Make a path to the mountain lion data folder in your file explorer. 
+# I set mine to be a geodatabase (.gdb) because it worked better for bringing it
+# in from ArcGIS Pro.
+gdb_path <- here("C:/Users/ekdew/Downloads/Mountain_Lion_Fire_Folder/lions.gdb")
+
+# load in the file from the perviously made geodatabase (.gdb)
+st_layers(gdb_path)
+# name the lion points 
+lions_3 <- st_read(dsn = gdb_path, layer = "lion_deployments")
+
+# check the coordinate system
+st_crs(lions_3)
+
+# Create a new dataframe with corrected coordinates.
+# You need to "mutate" the coordinates from lions_3 to be in their own 
+# columns, to avoid them being projected incorrectly from the original 
+# coordinate system. Then select the columns you want from lions_3 to be 
+# in the new dataframe:
+lions_df <- lions_3  %>% 
+  mutate(
+    X = st_coordinates(.)[,1],
+    Y = st_coordinates(.)[,2]
+  ) %>%
+  st_drop_geometry() %>% 
+  select(animal_id, sex, age, datetime_local, X, Y)
+
+# convert to tracks. My points belong in the coordinate system "26910",
+# because that is the coordinate system of Northern California.
+trk <- make_track(lions_df, X, Y, datetime_local,animal_id=animal_id, sex=sex, age=age,  crs = 26910)
+
+
+# data needs to be nested by animal to do resampling. If you click on this "trk_nested",
+# each lion is in a single row, and the other corresponding row holds an entire dataframe
+# for that lion. This is "nested".
+trk_nested <- trk %>% 
+  nest(data = -"animal_id")
+
+
+# Resample the nested tracks (trk_nested). 
+# Choose the time between GPS pings. The GPS collars pinged every 2 hours,
+# and to catch any that were early/late, I added a 20 minute tolerance.
+trk_nested_resampled <- trk_nested  %>%  
+  mutate(trks = map(data, function(x) 
+    x %>% track_resample(rate = hours(2), tolerance = minutes(20)) %>% steps_by_burst()))  
+
+
+# Create steps (stp) from the "trk_nested_resampled" dataframe.
+# select the fields you want to keep in the steps
+# Unnest the tracks (trks)
+stp <- trk_nested_resampled %>% 
+  select(animal_id, trks) %>% 
+  unnest(trks)
+
+#check it out
+View(stp)
+summary(stp)
+
+
+# generate random steps from the "stp" 
+# set.seed can have any number you want in it.
+# I set 20 random steps per actual step
+stp <- stp %>% 
+  filter(sl_ > 0)
+set.seed(20220307) 
+obs_avail <- random_steps(stp, n_control = 20)
+
+# These values can he helpful for further analysis down the road
+sl_distr(obs_avail)
+ta_distr(obs_avail)
+
+# Calculate the log of the step length (sl_) and the cosine of the turn angle (ta_)
+obs_avail <- obs_avail %>%
+  mutate(log_sl_ = log(sl_),
+         cos_ta_ = cos(ta_))
+
+# Bring in habitat/environmental data. I created my habitat data in ArcGIS Pro.
+# I had 3 layers of environmental data per year, ranging from 1996 - 2024. 
+# I had burn severity layers, vegetation layers, and "years since burn" layers.
+# These were all rasters, and I didin't want to bring them into R all seperately,
+# so I used the "Composite Band" tool in ArcGIS Pro to merge the three layers into 
+# one layer per year. I now had a single composite layer of vegetation, 
+# burn severity, and years since burn per year. I had one of these composite layers per year,
+# totaling to 28 layers.
+
+# Label the names of the layers I merged into one layer. The layers will be their own
+# field in the newly created composite layer. 
+layer_names <- c("vegetation", "age_burnsev")
+
+# Load in the composite layers and add in the names of the fields
+composite_band_fs_2024 <-stack("Comp_bands_fs_2024.tif")
+names(composite_band_fs_2024) <- layer_names
+plot(composite_band_fs_2024)
+
+composite_band_fs_2023 <-stack("Comp_bands_fs_2023.tif")
+names(composite_band_fs_2023) <- layer_names
+plot(composite_band_fs_2023)
+
+composite_band_fs_2022 <-stack("Comp_bands_fs_2022.tif")
+names(composite_band_fs_2022) <- layer_names
+
+composite_band_fs_2021 <-stack("Comp_bands_fs_2021.tif")
+names(composite_band_fs_2021) <- layer_names
+
+composite_band_fs_2020 <-stack("Comp_bands_fs_2020.tif")
+names(composite_band_fs_2020) <- layer_names
+
+composite_band_fs_2019 <-stack("Comp_bands_fs_2019.tif")
+names(composite_band_fs_2019) <- layer_names
+
+composite_band_fs_2018 <-stack("Comp_bands_fs_2018.tif")
+names(composite_band_fs_2018) <- layer_names
+
+composite_band_fs_2017 <-stack("Comp_bands_fs_2017.tif")
+names(composite_band_fs_2017) <- layer_names
+
+composite_band_fs_2016 <-stack("Comp_bands_fs_2016.tif")
+names(composite_band_fs_2016) <- layer_names
+plot(composite_band_fs_2016)
+
+# Moving on to adding our environmental data to our steps.
+# The "extract_covariates()" function extracts  the environmental data from the
+# composite bands, ans adds it to the steps (obs_avail). 
+# Filter to only add the correct year of environmental data to the correct year 
+# of steps in the obs_avail.
+
+
+covs_2024 <- obs_avail %>%   filter(year(t1_) == 2024) %>%   extract_covariates(composite_band_fs_2024)
+
+covs_2023 <- obs_avail %>%   filter(year(t1_) == 2023) %>%   extract_covariates(composite_band_fs_2023)
+
+covs_2022 <- obs_avail %>%   filter(year(t1_) == 2022) %>%   extract_covariates(composite_band_fs_2022)
+
+covs_2021 <- obs_avail %>%   filter(year(t1_) == 2021) %>%   extract_covariates(composite_band_fs_2021)
+
+covs_2020 <- obs_avail %>%   filter(year(t1_) == 2020) %>%   extract_covariates(composite_band_fs_2020)
+
+covs_2019 <- obs_avail %>%   filter(year(t1_) == 2019) %>%   extract_covariates(composite_band_fs_2019)
+
+covs_2018 <- obs_avail %>%   filter(year(t1_) == 2018) %>%   extract_covariates(composite_band_fs_2018)
+
+covs_2017 <- obs_avail %>%   filter(year(t1_) == 2017) %>%   extract_covariates(composite_band_fs_2017)
+
+covs_2016 <- obs_avail %>%   filter(year(t1_) == 2016) %>%   extract_covariates(composite_band_fs_2016)
+
+# Merge all of the "covs" together to create a comprehensive dataframe of all
+# the steps and environmental data
+obs_avail_covariates <- bind_rows(covs_2024, covs_2023, covs_2022, covs_2021, covs_2020, covs_2019, covs_2018, covs_2017, covs_2016)
+
+# name the levels within the newly added variables (veg and burn sev)
+
+obs_avail_covariates$vegetation <- factor(obs_avail_covariates$vegetation, 
+                         levels = c(1, 2, 3), 
+                         labels = c("Other", "Shrub", "Forest"))
+
+obs_avail_covariates$age_burnsev <- factor(obs_avail_covariates$age_burnsev, 
+                                          levels = c(1, 2, 3, 4, 5, 6, 7), 
+                                          labels = c("Other", "0-2, Moderate", "0-2, High", "0-2, Low", "3-10, Low", "3-10, Moderate", "3-10, High"))
+
+levels(obs_avail_covariates$vegetation)
+levels(obs_avail_covariates$age_burnsev)
+# check it out
+summary(obs_avail_covariates)
+
+#write.csv(obs_avail_covariates, "C:/Users/ekdew/Downloads/Mountain_Lion_Fire_Folder/obs_avail_covariates_fs.csv", row.names = FALSE)
+# save it to your file explorer
+saveRDS(obs_avail_covariates, here("C:/Users/ekdew/Downloads/Mountain_Lion_Fire_Folder/obs_avail_covariates_fs"))
+
+# save it to an object (analysis_df)
+analysis_df_fs <- readRDS(here("C:/Users/ekdew/Downloads/Mountain_Lion_Fire_Folder/obs_avail_covariates_fs"))
+
+
+# check it out
+summary(analysis_df_fs)
+
+# count the unique values from the animal_id field in obs_avail_covariates,
+# and use the "pivot_wider()" function to widen the dataframe to include 
+# the "animal_id", "n", and "case" fields.
+count(obs_avail_covariates, animal_id, case_) %>% pivot_wider(id_cols = animal_id, values_from = n, names_from = case_) %>% view()
+
+
+# helpers to find which lions have data for all variable levels
+
+# check which lions interact with all levels of the vegetation classifications
+check_veg <- analysis_df_fs %>% filter(case_ == TRUE) %>% 
+  count(animal_id, vegetation) %>% pivot_wider(id_cols = animal_id, values_from = n, names_from = vegetation) %>% 
+  mutate(all.vegetation = if_all(-animal_id, ~ !is.na(.)))
+
+# check which lions interact with all levels of the (merged) burn severity and years since burn classifications
+check_age_sev <- analysis_df_fs %>% filter(case_ == TRUE) %>% 
+  count(animal_id, age_burnsev) %>% pivot_wider(id_cols = animal_id, values_from = n, names_from = age_burnsev) %>% 
+  mutate(all.age_burnsev = if_all(-animal_id, ~ !is.na(.)))
+
+# Check which lions interact with all variable levels
+good_lions <- full_join(check_age_sev %>% filter(all.age_burnsev == TRUE) %>% select(animal_id, all.age_burnsev),
+                        check_veg %>% filter(all.vegetation == TRUE) %>% select(animal_id, all.vegetation)) %>% 
+  mutate(good.lions = if_all(-animal_id, ~ !is.na(.)))
+
+# Now we fit a model
+
+# fitting separate model per lion
+lion_id = "P1"
+
+# create a function to fit a model for every individual lion
+# (you may have to highlight from "model_df" to "lion_id)" and then run that seperately at first)
+fit_model_per_lion <- function(lion_id) {
+  model_df <- analysis_df_fs %>% 
+    filter(animal_id == lion_id)
+  # create a model (m1) that uses the "fit_issf" (integrate step selection) to
+  # use the step select analysis for your steps and environmental data
+  # (you may have to highlight from "m1" to "= TRUE)" and then run that seperately at first)
+  m1 <- fit_issf(model_df, 
+                 # Response
+                 case_ ~ age_burnsev + vegetation +
+                   sl_ + log_sl_ + cos_ta_ +
+                   #make sure you include strata!!!
+                   strata(step_id_),
+                 model = TRUE)
+  return(m1)
+}
+
+# null issf model for lrt tests per lion
+# create a "null" version of the previous model.
+# this will be used to compare to the results of the previous model
+# to confirm that the results are significant compared to a null model.
+# (again, you may have to highlight those parts seperately and then run those first)
+
+fit_model_per_lion_null <- function(lion_id) {
+  model_df_null <- analysis_df_fs %>% 
+    filter(animal_id == lion_id)
+  
+  m1_null <- fit_issf(model_df_null, 
+                      # Response
+                      case_ ~1 +
+                        sl_ + log_sl_ + cos_ta_ +
+                        strata(step_id_),
+                      # Need this later for model predictions
+                      model = TRUE)
+  return(m1_null)
+}
+
+# Run a least Likelihood Ratio Test to compare the original model and the null model
+# by using the "anova()" function and a "chisq" test.
+anova(m1_null$model, m1$model, test = "Chisq")
+
+
+zlions <- filter(good_lions, good.lions == TRUE) %>% pull(animal_id)
+print(zlions)
+# fit a model per lion  
+p1_mods <- fit_model_per_lion("P1")
+p11_mods <- fit_model_per_lion("P11")
+p13_mods <- fit_model_per_lion("P13")
+p16_mods <- fit_model_per_lion("P16")
+p19_mods <- fit_model_per_lion("P19")
+p20_mods <- fit_model_per_lion("P20")
+p32_mods <- fit_model_per_lion("P32")
+p33_mods <- fit_model_per_lion("P33")
+p36_mods <- fit_model_per_lion("P36")
+p41_mods <- fit_model_per_lion("P41")
+p4_mods <- fit_model_per_lion("P4")
+p5_mods <- fit_model_per_lion("P5")
+
+#check the coefficient values for a lion
+plot(coef(p1_mods))
+
+# fit a null model per lion 
+p1_mods_null <- fit_model_per_lion_null("P1")
+p11_mods_null <- fit_model_per_lion_null("P11")
+p13_mods_null <- fit_model_per_lion_null("P13")
+p16_mods_null <- fit_model_per_lion_null("P16")
+p19_mods_null <- fit_model_per_lion_null("P19")
+p20_mods_null <- fit_model_per_lion_null("P20")
+p32_mods_null <- fit_model_per_lion_null("P32")
+p33_mods_null <- fit_model_per_lion_null("P33")
+p36_mods_null <- fit_model_per_lion_null("P36")
+p41_mods_null <- fit_model_per_lion_null("P41")
+p4_mods_null <- fit_model_per_lion_null("P4")
+p5_mods_null <- fit_model_per_lion_null("P5")
+
+# compare the null vs real models to find if your real model is significant
+# anova(model_null$model, model_full$model, test = "Chisq")
+
+p1_anova <- anova(p1_mods_null$model, p1_mods$model, test = "LRT")
+print(p1_anova)
+p11_anova <- anova(p11_mods_null$model, p11_mods$model, test = "LRT")
+print(p11_anova)
+p13_anova <- anova(p13_mods_null$model, p13_mods$model, test = "LRT")
+print(p13_anova)
+p16_anova <- anova(p16_mods_null$model, p16_mods$model, test = "LRT")
+print(p16_anova)
+p19_anova <- anova(p19_mods_null$model, p19_mods$model, test = "LRT")
+print(p19_anova)
+p20_anova <- anova(p20_mods_null$model, p20_mods$model, test = "LRT")
+print(p20_anova)
+p32_anova <- anova(p32_mods_null$model, p32_mods$model, test = "LRT")
+print(p32_anova)
+p33_anova <- anova(p33_mods_null$model, p33_mods$model, test = "LRT")
+print(p33_anova)
+p41_anova <- anova(p41_mods_null$model, p41_mods$model, test = "LRT")
+print(p41_anova)
+p4_anova <- anova(p4_mods_null$model, p4_mods$model, test = "LRT")
+print(p4_anova)
+p5_anova <- anova(p5_mods_null$model, p5_mods$model, test = "LRT")
+print(p5_anova)
+
+# a way to iterate the function "fit_model_per_lion" onto all the objects in "zlions"
+all_lion_models <- map(zlions, fit_model_per_lion)
+names(all_lion_models) <- zlions                                            
+
+# a way to iterate the function "coef" onto all the objects in "all_lion_models",
+# and to combine it into a dataframe
+all_lions_coefs <- map_df(all_lion_models, coef)
+all_lions_coefs$animal_id = zlions
+
+# make the dataframe for "all_lions_coefs" longer by animal_id, instead of wider
+all_lions_coefs_longer <- all_lions_coefs %>% 
+  pivot_longer(cols = -animal_id, names_to = "variable", values_to = "estimate") %>% 
+  filter(!variable %in% c("sl_", "log_sl_", "cos_ta_"))  %>% 
+  mutate(variable = variable %>% 
+           str_replace("vegetation|age_burnsev", "") %>% 
+           factor(levels = c("Shrub", "Forest", "0-2, Moderate", "0-2, High", "0-2, Low", "3-10, Low", "3-10, Moderate", "3-10, High")))
+
+# create a dataframe with all of the mean coefficients per lion
+mean_coefs <- all_lions_coefs_longer %>% 
+  group_by(variable) %>% 
+  summarise(mean.estimate = mean(estimate),
+            sd.estimate = sd(estimate)) %>% 
+  ungroup()
+
+write.csv(mean_coefs, "C:/Users/ekdew/Downloads/Mountain_Lion_Fire_Folder/mean_coefs.csv", row.names = FALSE)
+
+#plot them
+ggplot(mean_coefs, aes(x = variable, y = mean.estimate)) +
+  geom_point(data = mean_coefs, 
+             aes(yintercept = 0), 
+             linetype = "solid", size = 1) +  # Mean lines
+  labs(title = "Mean Coefficients", y = "Mean Estimates", x = "Variable")
+
+# to find data about infividual lions:
+#p1_mods_coefs <- coef(p1_mods)
+#p1_mods_coefs <- data.frame(term = names(p1_mods_coefs), estimate = as.numeric(p1_mods_coefs))
+#p1_mods_coefs <- p1_mods_coefs[-c(9, 10, 11), ]
+#ggplot(p1_mods_coefs, aes(x = term, y = estimate)) +
+#  geom_point(data = p1_mods_coefs, 
+#             aes(yintercept = 0), 
+#             linetype = "solid", size = 1) +  # Mean lines
+#  labs(title = "P1 Coefficients", y = "Estimates", x = "Variable")
+
+plot(mean_coefs$variable, mean_coefs$mean.estimate)
+plot(mean_coefs$variable, mean_coefs$sd.estimate)
+
+
+# Calculate the confidence intervals for the variables/classifications
+conf_int_mean_coefs <- mean_coefs %>%
+  mutate(
+    # 1. Calculate Standard Error
+    se = sd.estimate / sqrt(10),
+    
+    # 2. Get t-critical value for 95% confidence (two-tailed)
+    t_crit = qt(0.975, 9),
+    
+    # 3. Calculate Margin of Error
+    margin_error = t_crit * se,
+    
+    # 4. Calculate Confidence Interval bounds
+    lower_ci = mean.estimate - margin_error,
+    upper_ci = mean.estimate + margin_error
+  )
+
+# combine the "mean_coefs" and the conf_int_mean_coefs" dataframes to plot the confidence intervals
+mean_coefs <- cbind(mean_coefs, conf_int_mean_coefs)
+# delete repeated fields
+mean_coefs <- mean_coefs[, -c(4, 5, 6)]
+
+
+# plot the "mean_coefs"'s variable as the Y, and mean.estimate as the X, as
+# a graph/chart to show the lion selection for the variable classifications
+all_lions_coefs_longer%>% 
+  ggplot() +
+  geom_point(aes(y = variable, x = estimate, color = animal_id)) +
+  geom_point(data = mean_coefs, aes(y = variable, x = mean.estimate)) +
+  geom_errorbar(data = mean_coefs, aes(y = variable, xmin = mean.estimate - sd.estimate, , xmax = mean.estimate + sd.estimate)) +
+  geom_vline(xintercept = 0)+
+  # wont work to add the CIs: geom_ribbon(data = mean_coefs, aes(x = mean.estimate, ymin = lower_ci, ymax = upper_ci), alpha = 0.2)
+  
+  str(m1, 1)
+
+
+
+
+#extracting 95% confidence interval for each lion
+p1_mods_summary <- summary(p1_mods)$conf.int
+p1_CI_upper_95 <- p1_mods_summary[, "upper .95"]
+p1_CI_lower_95 <- p1_mods_summary[, "lower .95"]
+p1_CI_df <- data.frame(upper95 = p1_CI_upper_95, lower95 = p1_CI_lower_95)
+
+p11_mods_summary <- summary(p11_mods)$conf.int
+p11_CI_upper_95 <- p11_mods_summary[, "upper .95"]
+p11_CI_lower_95 <- p11_mods_summary[,"lower .95"]
+p11_CI_df <- data.frame(upper95 = p11_CI_upper_95, lower95 = p11_CI_lower_95)
+
+p13_mods_summary <- summary(p13_mods)$conf.int
+p13_CI_upper_95 <- p13_mods_summary[, "upper .95"]
+p13_CI_lower_95 <- p13_mods_summary[,"lower .95"]
+p13_CI_df <- data.frame(upper95 = p13_CI_upper_95, lower95 = p13_CI_lower_95)
+
+p16_mods_summary <- summary(p16_mods)$conf.int
+p16_CI_upper_95 <- p16_mods_summary[, "upper .95"]
+p16_CI_lower_95 <- p16_mods_summary[,"lower .95"]
+p16_CI_df <- data.frame(upper95 = p16_CI_upper_95, lower95 = p16_CI_lower_95)
+
+p19_mods_summary <- summary(p19_mods)$conf.int
+p19_CI_upper_95 <- p19_mods_summary[, "upper .95"]
+p19_CI_lower_95 <- p19_mods_summary[,"lower .95"]
+p19_CI_df <- data.frame(upper95 = p19_CI_upper_95, lower95 = p19_CI_lower_95)
+
+p30_mods_summary <- summary(p30_mods)$conf.int
+p30_CI_upper_95 <- p30_mods_summary[, "upper .95"]
+p30_CI_lower_95 <- p30_mods_summary[,"lower .95"]
+p30_CI_df <- data.frame(upper95 = p30_CI_upper_95, lower95 = p30_CI_lower_95)
+
+p4_mods_summary <- summary(p4_mods)$conf.int
+p4_CI_upper_95 <- p4_mods_summary[, "upper .95"]
+p4_CI_lower_95 <- p4_mods_summary[,"lower .95"]
+p4_CI_df <- data.frame(upper95 = p4_CI_upper_95, lower95 = p4_CI_lower_95)
+
+p5_mods_summary <- summary(p5_mods)$conf.int
+p5_CI_upper_95 <- p5_mods_summary[, "upper .95"]
+p5_CI_lower_95 <- p5_mods_summary[,"lower .95"]
+p5_CI_df <- data.frame(upper95 = p5_CI_upper_95, lower95 = p5_CI_lower_95)
+
+#combined into one data frame
+Conf_Ints <- data.frame(P1_Lower = p1_CI_lower_95, P1_Upper = p1_CI_upper_95, P11_Lower = p11_CI_lower_95, P11_Upper = p11_CI_upper_95, P13_Lower = p13_CI_lower_95, P13_Upper = p13_CI_upper_95, P16_Lower = p16_CI_lower_95, P16_Upper = p16_CI_upper_95, P19_Lower = p19_CI_lower_95, P19_Upper = p19_CI_upper_95, P30_Lower = p30_CI_lower_95, P30_Upper = p30_CI_upper_95, P4_Lower = p4_CI_lower_95, P4_Upper = p4_CI_upper_95, P5_Lower = p5_CI_lower_95, P5_Upper = p5_CI_upper_95)
+
